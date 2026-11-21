@@ -1,0 +1,239 @@
+"""FastAPI backend for the Iqra University LMS Chatbot."""
+import json
+import time
+from contextlib import asynccontextmanager
+from typing import Literal, Optional
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+import ai
+import database as db
+import pdf_utils
+import lms_scraper
+
+MAX_PDF_BYTES = 15 * 1024 * 1024
+MAX_DOCS_PER_CHAT = 5
+HISTORY_LIMIT = 12
+
+
+# IQRA LMS cache: refresh after 5 minutes
+_LMS_CACHE = ""
+_LMS_CACHE_TIME = 0
+_LMS_CACHE_TTL = 300
+
+
+def is_lms_question(message):
+    keywords = (
+        "lms", "iqra", "assignment", "assignments",
+        "announcement", "announcements", "course", "courses",
+        "deadline", "due date", "timetable", "schedule",
+        "class", "classes", "quiz", "submission",
+        "pending", "marks", "teacher", "subject"
+    )
+    text = message.lower()
+    return any(word in text for word in keywords)
+
+
+def get_lms_context():
+    global _LMS_CACHE, _LMS_CACHE_TIME
+
+    if _LMS_CACHE and time.monotonic() - _LMS_CACHE_TIME < _LMS_CACHE_TTL:
+        return _LMS_CACHE
+
+    data = lms_scraper.fetch_lms_data()
+    sections = []
+
+    sections.append("COURSES:")
+    for item in data["courses"]:
+        sections.append(f"- {item['name']}")
+
+    sections.append("\\nASSIGNMENTS:")
+    for item in data["assignments"]:
+        sections.append(
+            f"- Course: {item['course']} | Title: {item['title']} "
+            f"| Details: {item.get('details', '')[:200]} "
+            f"| URL: {item['url']}"
+        )
+
+    sections.append("\\nANNOUNCEMENTS:")
+    for item in data["announcements"]:
+        sections.append(
+            f"- Course: {item['course']} | Title: {item['title']} "
+            f"| Details: {item.get('body', '')[:200]}"
+        )
+
+    _LMS_CACHE = "\\n".join(sections)[:4000]
+    _LMS_CACHE_TIME = time.monotonic()
+    return _LMS_CACHE
+
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    db.init_db()
+    yield
+
+
+app = FastAPI(title="Iqra LMS Chatbot API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatRequest(BaseModel):
+    chat_id: Optional[int] = None
+    message: str = Field(default="", max_length=6000)
+    web_search: bool = True
+    style: Literal["short", "detailed"] = "detailed"
+    regenerate: bool = False
+
+
+def line(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+# ------------------------------------------------------------ simple routes
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "model": ai.GROQ_MODEL}
+
+
+@app.get("/api/chats")
+def list_chats():
+    return db.list_chats()
+
+
+@app.post("/api/chats")
+def create_chat():
+    return {"id": db.create_chat()}
+
+
+@app.get("/api/chats/{chat_id}")
+def get_chat(chat_id: int):
+    chat = db.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(404, "Chat not found.")
+    return {"chat": chat, "messages": db.get_messages(chat_id), "documents": db.list_documents(chat_id)}
+
+
+@app.delete("/api/chats/{chat_id}", status_code=204)
+def delete_chat(chat_id: int):
+    db.delete_chat(chat_id)
+
+
+@app.post("/api/chats/{chat_id}/documents")
+async def upload_document(chat_id: int, file: UploadFile = File(...)):
+    if not db.get_chat(chat_id):
+        raise HTTPException(404, "Chat not found.")
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported.")
+    if len(db.list_documents(chat_id)) >= MAX_DOCS_PER_CHAT:
+        raise HTTPException(400, f"You can attach up to {MAX_DOCS_PER_CHAT} PDFs per chat.")
+    data = await file.read(MAX_PDF_BYTES + 1)
+    if len(data) > MAX_PDF_BYTES:
+        raise HTTPException(413, "PDF is too large. Maximum size is 15 MB.")
+    if not data.startswith(b"%PDF"):
+        raise HTTPException(400, "This file is not a valid PDF.")
+    try:
+        text, pages = await run_in_threadpool(pdf_utils.extract_text, data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    doc_id = db.add_document(chat_id, file.filename, pages, text)
+    return {"id": doc_id, "filename": file.filename, "pages": pages}
+
+
+@app.delete("/api/documents/{doc_id}", status_code=204)
+def delete_document(doc_id: int):
+    db.delete_document(doc_id)
+
+
+# ------------------------------------------------------------ chat streaming
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    message = req.message.strip()
+    if not req.regenerate and not message:
+        raise HTTPException(400, "Message cannot be empty.")
+
+    # --- prepare chat + history (errors here become normal HTTP errors)
+    if req.chat_id:
+        if not db.get_chat(req.chat_id):
+            raise HTTPException(404, "Chat not found.")
+        chat_id = req.chat_id
+    elif req.regenerate:
+        raise HTTPException(400, "Nothing to regenerate.")
+    else:
+        chat_id = db.create_chat()
+
+    if req.regenerate:
+        db.delete_last_assistant(chat_id)
+        user_msgs = [m for m in db.get_messages(chat_id) if m["role"] == "user"]
+        if not user_msgs:
+            raise HTTPException(400, "Nothing to regenerate.")
+        message = user_msgs[-1]["content"]
+    else:
+        db.add_message(chat_id, "user", message)
+        if db.get_chat(chat_id)["title"] == "New chat":
+            db.set_title(chat_id, message[:50] + ("..." if len(message) > 50 else ""))
+
+    history = db.get_messages(chat_id)[-HISTORY_LIMIT:]
+    docs = db.list_documents(chat_id, with_text=True)
+    intent = ai.detect_intent(message, bool(docs))
+    use_search = req.web_search and intent != "pdf"
+
+    async def generate():
+        yield line({"type": "meta", "chat_id": chat_id, "intent": intent})
+        sources, answer, saved = [], "", False
+        try:
+            if use_search:
+                yield line({"type": "status", "data": "Searching the web"})
+                try:
+                    sources = await ai.web_search(message)
+                    yield line({"type": "sources", "data": sources})
+                except ai.SearchError as e:
+                    yield line({"type": "notice", "data": str(e)})
+
+            lms_context = ""
+
+            if is_lms_question(message):
+                yield line({"type": "status", "data": "Reading IQRA LMS"})
+                try:
+                    lms_context = await run_in_threadpool(get_lms_context)
+                except Exception as exc:
+                    yield line({
+                        "type": "notice",
+                        "data": "IQRA LMS data could not be loaded. Please check your LMS session."
+                    })
+
+            yield line({"type": "status", "data": "Writing the answer"})
+            system_prompt = ai.build_system_prompt(
+                intent,
+                req.style,
+                ai.build_doc_context(docs, message),
+                sources,
+                lms_context=lms_context
+            )
+            async for token in ai.stream_answer(system_prompt, history):
+                answer += token
+                yield line({"type": "token", "data": token})
+
+            if not answer.strip():
+                yield line({"type": "error", "data": "The AI returned an empty answer. Please try again."})
+            else:
+                msg_id = db.add_message(chat_id, "assistant", answer, sources)
+                saved = True
+                yield line({"type": "done", "message_id": msg_id})
+        except Exception as exc:  # noqa: BLE001 - show a friendly message to the user
+            yield line({"type": "error", "data": ai.friendly_error(exc)})
+        finally:
+            # Keeps partial answers when the user presses Stop
+            if not saved and answer.strip():
+                db.add_message(chat_id, "assistant", answer, sources)
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")

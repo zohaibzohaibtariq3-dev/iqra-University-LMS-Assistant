@@ -1,0 +1,12 @@
+﻿venv/
+.venv/
+venv-linux/
+__pycache__/
+*.pyc
+.env
+node_modules/
+.DS_Store
+.vscode/
+
+backend/lms_session.json
+backend/lms_chatbot.db
